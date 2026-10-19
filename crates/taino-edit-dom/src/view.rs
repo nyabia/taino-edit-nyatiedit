@@ -56,6 +56,9 @@ pub struct EditorView {
     /// itself is "transparent" — its children become the direct children of
     /// the root element.
     children: Vec<ViewDesc>,
+    /// Bare presentation breaks verified during adoption of nonempty textblocks.
+    /// Track exact node identities so later updates never remove unrelated BRs.
+    adopted_breaks: Vec<(Element, Element)>,
     /// `true` while an IME composition is in progress — adapters wire
     /// `compositionstart`/`compositionend` to flip it. While set,
     /// [`read_dom_changes`](EditorView::read_dom_changes) returns `None` so
@@ -127,6 +130,7 @@ impl EditorView {
             schema,
             doc,
             children,
+            adopted_breaks: Vec::new(),
             composing: Cell::new(false),
             decorations: Vec::new(),
             plugins: Vec::new(),
@@ -609,6 +613,17 @@ impl EditorView {
     /// `nodeValue` in place, same-type elements recurse, and only nodes that
     /// truly changed are removed/replaced/appended.
     pub fn update(&mut self, new_doc: Node) {
+        // Adoption cannot alter the native IME DOM. Once an adapter permits a
+        // normal update, remove only the exact bare placeholders it verified,
+        // before patch_children can append an inline sibling after them.
+        for (parent, br) in self.adopted_breaks.drain(..) {
+            let still_last = parent
+                .last_child()
+                .is_some_and(|last| last.is_same_node(Some(br.as_ref())));
+            if still_last && br.attributes().length() == 0 && is_presentation_break(br.as_ref()) {
+                let _ = parent.remove_child(&br);
+            }
+        }
         let document = self
             .root
             .owner_document()
@@ -618,6 +633,143 @@ impl EditorView {
         self.children = new_descs;
         self.doc = new_doc;
     }
+
+    /// Adopt a document already represented by the browser's live DOM.
+    ///
+    /// Unlike [`update`](Self::update), this never changes the mounted DOM or
+    /// browser selection. It verifies detached renderings and binds descriptors
+    /// to the existing nodes, preserving IME text-node identity. A textblock may
+    /// have one direct presentation-only trailing `<br>` (marked or bare).
+    /// Noncanonical wrappers, split text runs, and other mismatches are rejected.
+    /// On failure, the view's document and descriptors remain unchanged.
+    pub fn adopt_dom(&mut self, new_doc: Node) -> bool {
+        if new_doc.node_type() != self.doc.node_type() {
+            return false;
+        }
+        let Some(document) = self.root.owner_document() else {
+            return false;
+        };
+        let expected: Vec<ViewDesc> = new_doc
+            .content()
+            .iter()
+            .map(|node| render(node, &document))
+            .collect();
+        let mut adopted_breaks = Vec::new();
+        let Some(children) = adopt_children(&expected, &self.root, false, &mut adopted_breaks)
+        else {
+            return false;
+        };
+        self.children = children;
+        self.adopted_breaks = adopted_breaks;
+        self.doc = new_doc;
+        true
+    }
+}
+
+// Adoption only creates detached comparison nodes and Rust descriptors. Do not
+// normalize, merge, remove, or replace live nodes while an IME may retain them.
+fn same_element_shell(expected: &Element, actual: &Element) -> bool {
+    match (
+        expected.clone_node_with_deep(false),
+        actual.clone_node_with_deep(false),
+    ) {
+        (Ok(expected), Ok(actual)) => expected.is_equal_node(Some(&actual)),
+        _ => false,
+    }
+}
+
+fn is_presentation_break(node: &web_sys::Node) -> bool {
+    let Some(element) = node.dyn_ref::<Element>() else {
+        return false;
+    };
+    element.tag_name() == "BR"
+        && element.child_nodes().length() == 0
+        && (element.attributes().length() == 0
+            || (element.attributes().length() == 1
+                && element.get_attribute(TRAILING_BREAK_ATTR).as_deref() == Some("")))
+}
+
+fn adopt_children(
+    expected: &[ViewDesc],
+    actual: &Element,
+    textblock: bool,
+    adopted_breaks: &mut Vec<(Element, Element)>,
+) -> Option<Vec<ViewDesc>> {
+    let nodes = actual.child_nodes();
+    let count = nodes.length() as usize;
+    if count != expected.len() {
+        if !textblock
+            || count != expected.len() + 1
+            || !is_presentation_break(&nodes.item(count as u32 - 1)?)
+        {
+            return None;
+        }
+        if !expected.is_empty() {
+            let br: Element = nodes.item(count as u32 - 1)?.dyn_into().ok()?;
+            if br.attributes().length() == 0 {
+                adopted_breaks.push((actual.clone(), br));
+            }
+        }
+    }
+    expected
+        .iter()
+        .enumerate()
+        .map(|(index, desc)| adopt_desc(desc, &nodes.item(index as u32)?, adopted_breaks))
+        .collect()
+}
+
+fn adopt_desc(
+    expected: &ViewDesc,
+    actual: &web_sys::Node,
+    adopted_breaks: &mut Vec<(Element, Element)>,
+) -> Option<ViewDesc> {
+    match expected {
+        ViewDesc::Element {
+            node,
+            dom,
+            children,
+        } => {
+            let actual: Element = actual.clone().dyn_into().ok()?;
+            if !same_element_shell(dom, &actual) {
+                return None;
+            }
+            let children = adopt_children(children, &actual, is_textblock(node), adopted_breaks)?;
+            Some(ViewDesc::Element {
+                node: node.clone(),
+                dom: actual,
+                children,
+            })
+        }
+        ViewDesc::Text { node, wrapper, .. } => {
+            let text = adopt_text_leaf(&expected.dom_node(), actual)?;
+            let wrapper = if wrapper.is_some() {
+                Some(actual.clone().dyn_into::<Element>().ok()?)
+            } else {
+                None
+            };
+            Some(ViewDesc::Text {
+                node: node.clone(),
+                text,
+                wrapper,
+            })
+        }
+    }
+}
+
+fn adopt_text_leaf(expected: &web_sys::Node, actual: &web_sys::Node) -> Option<web_sys::Text> {
+    if let Some(expected) = expected.dyn_ref::<web_sys::Text>() {
+        let actual: web_sys::Text = actual.clone().dyn_into().ok()?;
+        return (expected.data() == actual.data()).then_some(actual);
+    }
+    let expected = expected.dyn_ref::<Element>()?;
+    let actual = actual.dyn_ref::<Element>()?;
+    if !same_element_shell(expected, actual)
+        || expected.child_nodes().length() != 1
+        || actual.child_nodes().length() != 1
+    {
+        return None;
+    }
+    adopt_text_leaf(&expected.first_child()?, &actual.first_child()?)
 }
 
 /// Build a `ViewDesc` for `node`, creating its DOM subtree along the way.

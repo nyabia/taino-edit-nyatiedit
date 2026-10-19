@@ -103,6 +103,62 @@ fn set_caret_in_text_writes_dom_selection() {
 }
 
 #[wasm_bindgen_test]
+fn korean_and_astral_emoji_selection_uses_dom_utf16_offsets() {
+    let s = schema();
+    let doc = s
+        .node(
+            "doc",
+            Default::default(),
+            vec![para(&s, "한😀👩\u{200d}💻글")],
+            vec![],
+        )
+        .unwrap();
+    let (view, root) = attach(doc, s);
+
+    // Core pos 3 is after 한 + 😀. The DOM must be after 3 UTF-16 units,
+    // not between the emoji's high and low surrogate at DOM offset 2.
+    view.set_selection(Selection::caret(3)).unwrap();
+    let sel = selection();
+    assert_eq!(sel.anchor_offset(), 3);
+    assert_eq!(view.read_selection(), Some(Selection::caret(3)));
+
+    // Select the three-scalar ZWJ sequence 👩 + ZWJ + 💻, five UTF-16 units.
+    view.set_selection(Selection::Text { anchor: 3, head: 6 })
+        .unwrap();
+    assert_eq!(sel.anchor_offset(), 3);
+    assert_eq!(sel.focus_offset(), 8);
+    assert_eq!(sel.to_string().as_string().unwrap(), "👩\u{200d}💻");
+    assert_eq!(
+        view.read_selection(),
+        Some(Selection::Text { anchor: 3, head: 6 })
+    );
+    cleanup(root);
+}
+
+#[wasm_bindgen_test]
+fn read_selection_uses_live_composition_text_before_model_commit() {
+    let s = schema();
+    let doc = s
+        .node("doc", Default::default(), vec![para(&s, "한글")], vec![])
+        .unwrap();
+    let (view, root) = attach(doc, s);
+    let text: Text = root
+        .first_child()
+        .unwrap()
+        .first_child()
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    view.composition_start();
+    text.set_data("한😀글");
+    let sel = selection();
+    sel.collapse_with_offset(Some(text.as_ref()), 3).unwrap();
+    assert_eq!(view.read_selection(), Some(Selection::caret(3)));
+    view.composition_end();
+    cleanup(root);
+}
+
+#[wasm_bindgen_test]
 fn caret_in_nested_block_round_trips() {
     // doc > blockquote > paragraph > "Hello". The caret between 'e' and 'l'
     // (text offset 2) is doc position 4. Before the position-map fix, the
